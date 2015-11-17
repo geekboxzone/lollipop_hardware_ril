@@ -22,6 +22,14 @@
 extern "C" {
 #endif
 
+#if (RIL_VERSION >= 7)
+    #define LOGD    ALOGD
+    #define LOGI    ALOGI
+    #define LOGW    ALOGW
+    #define LOGE    ALOGE
+    #define LOGV    ALOGV
+#endif
+
 /* define AT_DEBUG to send AT traffic to /tmp/radio-at.log" */
 #define AT_DEBUG  0
 
@@ -87,6 +95,11 @@ void at_set_on_timeout(void (*onTimeout)(void));
    channel is already closed */
 void at_set_on_reader_closed(void (*onClose)(void));
 
+int at_send_command_singleline_t (const char *command,
+                                const char *responsePrefix,
+                                long long timeoutMsec,
+                                 ATResponse **pp_outResponse);
+
 int at_send_command_singleline (const char *command,
                                 const char *responsePrefix,
                                  ATResponse **pp_outResponse);
@@ -98,10 +111,16 @@ int at_send_command_multiline (const char *command,
                                 const char *responsePrefix,
                                  ATResponse **pp_outResponse);
 
+int at_send_command_multiline_t (const char *command,
+                                const char *responsePrefix,
+                                long long timeoutMsec,
+                                 ATResponse **pp_outResponse);
 
 int at_handshake();
 
 int at_send_command (const char *command, ATResponse **pp_outResponse);
+
+int at_send_command_t (const char *command, long long timeoutMsec, ATResponse **pp_outResponse);
 
 int at_send_command_sms (const char *command, const char *pdu,
                             const char *responsePrefix,
@@ -112,7 +131,8 @@ void at_response_free(ATResponse *p_response);
 typedef enum {
     CME_ERROR_NON_CME = -1,
     CME_SUCCESS = 0,
-    CME_SIM_NOT_INSERTED = 10
+    CME_SIM_NOT_INSERTED = 10,
+    CME_SIM_FAILED = 13
 } AT_CME_Error;
 
 AT_CME_Error at_get_cme_error(const ATResponse *p_response);

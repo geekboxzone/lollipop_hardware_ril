@@ -46,6 +46,8 @@
 #define HANDSHAKE_RETRY_COUNT 8
 #define HANDSHAKE_TIMEOUT_MSEC 250
 
+// cmy: 在发送AT命令之前加点延时，防止多个命令下发时底层处理不过来
+#define DELAY_BEFORE_AT_CMD_MS     100
 static pthread_t s_tid_reader;
 static int s_fd = -1;    /* fd of the AT channel */
 static ATUnsolHandler s_unsolHandler;
@@ -54,6 +56,10 @@ static ATUnsolHandler s_unsolHandler;
 
 static char s_ATBuffer[MAX_AT_RESPONSE+1];
 static char *s_ATBufferCur = s_ATBuffer;
+
+static int s_ackPowerIoctl; /* true if TTY has android byte-count
+                                handshake for low power*/
+static int s_readCount = 0;
 
 #if AT_DEBUG
 void  AT_DUMP(const char*  prefix, const char*  buff, int  len)
@@ -85,6 +91,349 @@ static void onReaderClosed();
 static int writeCtrlZ (const char *s);
 static int writeline (const char *s);
 
+#define LG_VL600
+
+#ifdef LG_VL600
+static unsigned int send_seq = 0;
+static unsigned int recv_seq = -1;
+static const unsigned char VL600_CMD_HEADER[] = 
+{
+  0x5A, 0x48, 0x12, 0xA5, 
+  0, 0, 0, 0,
+  0, 0, 0, 0,
+  0x11, 0xF0
+};
+static const size_t VL600_CMD_HEADER_LEN = sizeof(VL600_CMD_HEADER)*sizeof(unsigned char);
+
+static unsigned char vl600_attach_cmd[1908] = 
+{
+  0x5A, 0x48, 0x12, 0xA5, 
+  0, 0, 0, 0,
+  0, 0, 0, 0,
+  0x21, 0xF0,
+};
+
+static char in_buf[MAX_AT_RESPONSE];
+static char out_buf[MAX_AT_RESPONSE];
+
+static void dump_pack(unsigned char* data, int len)
+{
+    int i=0;
+    int j=0;
+    char bs[3];
+    char out[128] = "\0";
+
+    int line = (len+15)/16;
+    for(i=0; i<line; i++)
+    {
+        for(j=0; j<16; j++)
+        {
+            if((i*16+j)>=len)
+                break;
+            sprintf(bs, " %02X", data[i*16+j]);
+            strcat(out, bs);
+        }
+        RLOGD("%s", out);
+        memset(out, 0, 128);
+//        strcat(out, "\n");
+    }
+}
+
+/*
+    return value:
+        success  > 0
+        failed   <= 0
+ */
+static int vl600_pack(const char* in, char* out, int buf_len)
+{
+    int len = strlen(in);
+    int out_len = VL600_CMD_HEADER_LEN+len;
+
+//    LOGD("vl600 packet");
+//    dump_pack(in, len);
+    
+    out_len += 4-(out_len%4);
+//    LOGD("in_len=%d, out_len=%d", len, out_len);
+
+    if( out_len > buf_len )
+    {
+        RLOGD("Out buffer not enough");
+        return 0;
+    }
+    
+    memset(out, 0, out_len);
+    memcpy(out, VL600_CMD_HEADER, VL600_CMD_HEADER_LEN);
+    *(unsigned int*)(out+4) = send_seq;
+    *(unsigned int*)(out+8) = len;
+    memcpy(out+VL600_CMD_HEADER_LEN, in, len);
+
+//    dump_pack(out, out_len);
+
+    send_seq++;
+//    LOGD("send_seq=%d", send_seq);
+    
+    return out_len;
+}
+
+/*
+    return value:
+        success  >= 0
+        failed   < 0
+ */
+static int vl600_unpack(const unsigned char *in, int in_len, const unsigned char *out, int max_len)
+{
+    unsigned char* p = in;
+    int p_len = in_len;
+    unsigned int seq = 0;
+    int len = 0;
+    int out_len;
+
+//    LOGD("vl600 unpacket");
+//    dump_pack(in, in_len);
+    
+    while(*p == 0){
+        ++p;
+        --p_len;
+    }
+
+    if(p_len<=14)
+    {
+        RLOGE("data len=%d", p_len);
+        return -1;
+    }
+
+    if( p[0] != 0x5a || p[1] != 0x48 || p[2] != 0x12 || p[3] != 0xa5 ||
+        p[12] != 0x11 || p[13] != 0xf0)
+    {
+        RLOGE("Invalid magic");
+        return -1;
+    }
+
+    seq = *(unsigned int*)(p+4);
+//    LOGD("seq=%d", seq);
+
+    if(seq == recv_seq)
+    {
+        RLOGE("Invalid sequence");
+        return -1;
+    }
+
+    recv_seq = seq;
+    
+    len = *(unsigned int*)(p+8);
+//    LOGD("len=%d, p_len=%d", len, p_len);
+
+    if(p_len < len+VL600_CMD_HEADER_LEN)
+    {
+        RLOGE("Packet incomplete");
+        return -1;
+    }
+    out_len = len>max_len?max_len:len;
+    memcpy(out, p+VL600_CMD_HEADER_LEN, out_len);
+    
+    if(len > max_len)
+    {
+        RLOGD("packet too long");
+    }
+
+//    dump_pack(out, out_len);
+
+    return out_len;
+}
+
+static unsigned char* vl600_setup_attach()
+{
+    unsigned char* cmd = vl600_attach_cmd;
+    unsigned int plen = 1891;
+
+    *(unsigned int*)(cmd+4) = send_seq;
+    *(unsigned int*)(cmd+8) = plen;
+    cmd[14] = 0xF1;
+    cmd[15] = 0x4A;
+    cmd[1908-6]=0xB1;
+    cmd[1908-5]=0xF3;
+    cmd[1908-4]=0x7E;
+    
+//    dump_pack(cmd, 1908);
+    
+    return cmd;
+}
+
+int vl600_attach()
+{
+    size_t cur = 0;
+    ssize_t written;
+
+    RLOGD("vl600_attach");
+
+    if (s_fd < 0 || s_readerClosed > 0) {
+        return AT_ERROR_CHANNEL_CLOSED;
+    }
+
+    unsigned char *cmd = vl600_setup_attach();
+    size_t len = sizeof(vl600_attach_cmd);
+
+    /* the main string */
+    while (cur < len) {
+        do {
+            written = write (s_fd, cmd + cur, len - cur);
+        } while (written < 0 && errno == EINTR);
+
+        if (written < 0) {
+            return AT_ERROR_GENERIC;
+        }
+
+        cur += written;
+    }
+
+    return 0;
+}
+#endif
+
+static void sleepMsec(long long msec);
+static int is_emulate = 0;
+static char cur_cmd[1024] = {0};
+
+int at_emulate_enter()
+{
+    is_emulate = 1;
+    sleepMsec(200);
+    
+    close(s_fd);
+    return 0;
+}
+
+int at_emulate_exit()
+{
+    if(is_emulate)
+    {
+        s_fd = open_at_port();
+        sleepMsec(1000);
+        
+        is_emulate = 0;
+
+        if(s_fd > 0 )
+            at_handshake();
+    }
+    return 0;
+}
+
+#if 1// UML290
+    char reponse_csq[256] = "+CSQ: 21, 99\r";
+    char reponse_cimi[256] = "311480009868905\r";
+    char reponse_cops[256] = "+COPS: 0,0,\"Verizon Wireless\",7\r";
+    char reponse_cgmm[256] = "+CGMM: UML290VW\r";
+    char reponse_cgsn[256] = "+CGSN: 990000475112084\r";
+    char reponse_creg[256] = "+CREG: 2,1\r";
+    char reponse_cgreg[256] = "+CGREG: 2,1, FFFE, 4EEC03, 7\r";
+    char reponse_sysinfo[256] = "^SYSINFO: 2,3,0,15,1,0,5\r";
+    char reponse_cgact[256] = "+CGACT: 1,1\r+CGACT: 3,1\r+CGACT: 4,0\r";
+    char reponse_cgdcont[256] = "+CGDCONT: 3,\"IPV4V6\",\"vzwinternet\",\"0.0.0.0\",0,0\r";
+#else
+    char reponse_csq[256] = "+CSQ: 10, 99\r";
+    char reponse_cimi[256] = "111110001111905\r";
+    char reponse_cops[256] = "+COPS: 0,0,\"TEST\",2\r";
+    char reponse_cgmm[256] = "+CGMM: TEST\r";
+    char reponse_cgsn[256] = "+CGSN: 110000115112084\r";
+    char reponse_creg[256] = "+CREG: 2,1\r";
+    char reponse_cgreg[256] = "+CGREG: 2,1, FFFE, 4EEC03\r";
+    char reponse_sysinfo[256] = "^SYSINFO: 2,3,0,15,1,0,5\r";
+    char reponse_cgact[256] = "+CGACT: 1,1\r";
+    char reponse_cgdcont[256] = "+CGDCONT: 1,\"IP\",\"cmnet\",,,0,0\r";
+#endif
+
+static int read_emulate(char* buf, int len)
+{
+    int ret = 0;
+
+    while(cur_cmd[0] == 0)
+    {
+        if(!is_emulate)
+        {
+            if(s_fd<0)
+                return -1;
+            else
+                break;
+        }
+        sleepMsec(20);
+    }
+
+    if ( strcmp(cur_cmd, "AT+CSQ")==0 )
+    {
+        strcpy(buf, reponse_csq);
+        ret = strlen(reponse_csq);
+    }
+    else if ( strcmp(cur_cmd, "AT+CFUN?")==0 )
+    {
+        strcpy(buf, "+CFUN: 1\r");
+        ret = strlen("+CFUN: 1\r");
+    }
+    else if ( strcmp(cur_cmd, "AT+CPIN?")==0 )
+    {
+        strcpy(buf, "+CPIN: READY\r");
+        ret = strlen("+CPIN: READY\r");
+    }
+    else if ( strcmp(cur_cmd, "AT+CIMI")==0 )
+    {
+        strcpy(buf, reponse_cimi);
+        ret = strlen(reponse_cimi);
+    }
+    else if ( strcmp(cur_cmd, "AT+COPS?")==0 )
+    {
+        strcpy(buf, reponse_cops);
+        ret = strlen(reponse_cops);
+    }
+    else if ( strcmp(cur_cmd, "AT+CGMM")==0 )
+    {
+        strcpy(buf, reponse_cgmm);
+        ret = strlen(reponse_cgmm);
+    }
+    else if ( strcmp(cur_cmd, "AT^MEID")==0 )
+    {
+        strcpy(buf, "^MEID: 12345678901234\r");
+        ret = strlen("^MEID: 12345678901234\r");
+    }
+    else if ( strcmp(cur_cmd, "AT+GSN")==0 )
+    {
+        strcpy(buf, "+GSN: 86e5515f\r");
+        ret = strlen("+GSN: 86e5515f\r");
+    }
+    else if ( strcmp(cur_cmd, "AT+CGSN")==0 )
+    {
+        strcpy(buf, reponse_cgsn);
+        ret = strlen(reponse_cgsn);
+    }
+    else if ( strcmp(cur_cmd, "AT+CREG?")==0 )
+    {
+        strcpy(buf, reponse_creg);
+        ret = strlen(reponse_creg);
+    }
+    else if ( strcmp(cur_cmd, "AT+CGREG?")==0 )
+    {
+        strcpy(buf, reponse_cgreg);
+        ret = strlen(reponse_cgreg);
+    }
+    else if ( strcmp(cur_cmd, "AT^SYSINFO")==0 )
+    {
+        strcpy(buf, reponse_sysinfo);
+        ret = strlen(reponse_sysinfo);
+    }
+    else if ( strcmp(cur_cmd, "AT+CGACT?")==0 )
+    {
+        strcpy(buf, reponse_cgact);
+        ret = strlen(reponse_cgact);
+    }
+    else if ( strcmp(cur_cmd, "AT+CGDCONT?")==0 )
+    {
+        strcpy(buf, reponse_cgdcont);
+        ret = strlen(reponse_cgdcont);
+    }
+    
+    strcat(buf, "OK\r");
+    ret += strlen("OK\r");
+
+    return ret;
+}
 #ifndef USE_NP
 static void setTimespecRelative(struct timespec *p_ts, long long msec)
 {
@@ -144,6 +493,10 @@ static const char * s_finalResponsesError[] = {
     "NO CARRIER", /* sometimes! */
     "NO ANSWER",
     "NO DIALTONE",
+    
+// cmy: 下面几个出错是HuaWei EM660C模块命令出错信息    
+    "COMMAND NOT SUPPORT",
+    "TOO MANY PARAMETERS",
 };
 static int isFinalResponseError(const char *line)
 {
@@ -369,13 +722,33 @@ static const char *readline()
             p_read = s_ATBuffer;
         }
 
-        do {
-            count = read(s_fd, p_read,
-                            MAX_AT_RESPONSE - (p_read - s_ATBuffer));
-        } while (count < 0 && errno == EINTR);
+        if(is_emulate)
+        {
+            count = read_emulate(p_read,
+                                MAX_AT_RESPONSE - (p_read - s_ATBuffer));
+            cur_cmd[0] = 0;
+        }
+        // cmy@20120105: for LG VL600
+        else if(!modem_cmp(0x1004, 0x61AA, NULL))
+        {
+            memset(in_buf, 0, MAX_AT_RESPONSE);
+            do {
+                count = read(s_fd, in_buf, MAX_AT_RESPONSE);
+                if(count > 0)
+                    count = vl600_unpack(in_buf, count, p_read, MAX_AT_RESPONSE - (p_read - s_ATBuffer));
+            } while (count < 0 && errno == EINTR);
+        }
+        else
+        {
+            do {
+                count = read(s_fd, p_read,
+                                MAX_AT_RESPONSE - (p_read - s_ATBuffer));
+            } while (count < 0 && errno == EINTR);
+        }
 
         if (count > 0) {
             AT_DUMP( "<< ", p_read, count );
+            s_readCount += count;
 
             p_read[count] = '\0';
 
@@ -485,11 +858,43 @@ static int writeline (const char *s)
 
     AT_DUMP( ">> ", s, strlen(s) );
 
-    /* the main string */
-    while (cur < len) {
-        do {
-            written = write (s_fd, s + cur, len - cur);
-        } while (written < 0 && errno == EINTR);
+    if(is_emulate)
+    {
+        if(cur_cmd[0] == 0)
+            strcpy(cur_cmd, s);
+    }
+    // cmy@20120105: for LG VL600
+    else if(!modem_cmp(0x1004, 0x61AA, NULL))
+    {
+        memset(in_buf, 0, MAX_AT_RESPONSE);
+        memset(out_buf, 0, MAX_AT_RESPONSE);
+        sprintf(in_buf, "%s\r", s);
+        len = vl600_pack(in_buf, out_buf, MAX_AT_RESPONSE);
+        if(len <= 0) 
+            return AT_ERROR_GENERIC;
+
+        /* the main string */
+        while (cur < len) {
+            do {
+                written = write (s_fd, out_buf + cur, len - cur);
+            } while (written < 0 && errno == EINTR);
+
+            if (written < 0) {
+                return AT_ERROR_GENERIC;
+            }
+
+            cur += written;
+        }
+
+//        sleepMsec(500);
+    }
+    else
+    {
+        /* the main string */
+        while (cur < len) {
+            do {
+                written = write (s_fd, s + cur, len - cur);
+            } while (written < 0 && errno == EINTR);
 
         if (written < 0) {
             return AT_ERROR_GENERIC;
@@ -504,8 +909,9 @@ static int writeline (const char *s)
         written = write (s_fd, "\r" , 1);
     } while ((written < 0 && errno == EINTR) || (written == 0));
 
-    if (written < 0) {
-        return AT_ERROR_GENERIC;
+        if (written < 0) {
+            return AT_ERROR_GENERIC;
+        }
     }
 
     return 0;
@@ -680,6 +1086,7 @@ static int at_send_command_full_nolock (const char *command, ATCommandType type,
         goto error;
     }
 
+    sleepMsec(DELAY_BEFORE_AT_CMD_MS);
     err = writeline (command);
 
     if (err < 0) {
@@ -777,6 +1184,11 @@ static int at_send_command_full (const char *command, ATCommandType type,
  * if non-NULL, the resulting ATResponse * must be eventually freed with
  * at_response_free
  */
+int at_send_command_t(const char *command, long long timeoutMsec, ATResponse **pp_outResponse)
+{
+    return at_send_command(command, pp_outResponse);
+}
+
 int at_send_command (const char *command, ATResponse **pp_outResponse)
 {
     int err;
@@ -787,6 +1199,14 @@ int at_send_command (const char *command, ATResponse **pp_outResponse)
     return err;
 }
 
+
+int at_send_command_singleline_t (const char *command,
+                                const char *responsePrefix,
+                                long long timeoutMsec,
+                                 ATResponse **pp_outResponse)
+{
+    return at_send_command_singleline(command, responsePrefix, pp_outResponse);
+}
 
 int at_send_command_singleline (const char *command,
                                 const char *responsePrefix,
@@ -857,6 +1277,14 @@ int at_send_command_sms (const char *command,
 }
 
 
+int at_send_command_multiline_t (const char *command,
+                                const char *responsePrefix,
+                                long long timeoutMsec,
+                                 ATResponse **pp_outResponse)
+{
+    return at_send_command_multiline(command, responsePrefix, pp_outResponse);
+}
+
 int at_send_command_multiline (const char *command,
                                 const char *responsePrefix,
                                  ATResponse **pp_outResponse)
@@ -908,7 +1336,7 @@ int at_handshake()
 
     for (i = 0 ; i < HANDSHAKE_RETRY_COUNT ; i++) {
         /* some stacks start with verbose off */
-        err = at_send_command_full_nolock ("ATE0Q0V1", NO_RESULT,
+        err = at_send_command_full_nolock ("ATE0", NO_RESULT,
                     NULL, NULL, HANDSHAKE_TIMEOUT_MSEC, NULL);
 
         if (err == 0) {

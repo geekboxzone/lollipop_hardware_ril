@@ -6,13 +6,17 @@ LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES:= \
-    reference-ril.c \
+    ril-rk29-dataonly.c \
     atchannel.c \
     misc.c \
-    at_tok.c
-
+    at_tok.c \
+    extend_at_func.c \
+    modem_define_func.c \
+    operator_table.c \
+    gsm.c
+LOCAL_MODULE_TAGS := optional
 LOCAL_SHARED_LIBRARIES := \
-    liblog libcutils libutils libril librilutils
+    liblog libcutils libutils libril librilutils libhardware_legacy libnetutils
 
 # for asprinf
 LOCAL_CFLAGS := -D_GNU_SOURCE
@@ -36,7 +40,7 @@ ifeq (foo,foo)
   LOCAL_SHARED_LIBRARIES += \
       libcutils libutils
   LOCAL_CFLAGS += -DRIL_SHLIB
-  LOCAL_MODULE:= libreference-ril
+  LOCAL_MODULE:= libril-rk29-dataonly
   include $(BUILD_SHARED_LIBRARY)
 else
   #build executable
